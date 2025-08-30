@@ -1,0 +1,68 @@
+CREATE OR REPLACE TABLE `neogen-ga4-export.reporting_enterprise.daily_sessions_active_users` 
+AS
+-- GA4-aligned: sessions attributed to first hostname per session
+SELECT
+  COALESCE(s.date, u.date)           AS date,
+  COALESCE(s.market_id, u.market_id) AS market_id,
+  COALESCE(s.hostname, u.hostname)   AS hostname,
+  IFNULL(u.users, 0)                 AS users,
+  IFNULL(u.active_u, 0)              AS active_u,
+  IFNULL(s.sessions, 0)              AS sessions
+FROM (
+
+  -- A) Sessions by first hostname (dedupe per session)
+  WITH base AS (
+    SELECT
+      -- If GA4 property is not UTC, replace next line with:
+      -- DATE(TIMESTAMP_MICROS(e.event_timestamp), 'America/Chicago') AS date,
+      PARSE_DATE('%Y%m%d', e.event_date) AS date,
+      (SELECT value.string_value FROM UNNEST(e.event_params) WHERE key = 'market_id') AS market_id,
+      e.device.web_info.hostname AS hostname,
+      e.user_pseudo_id,
+      SAFE_CAST((SELECT value.int_value FROM UNNEST(e.event_params) WHERE key = 'ga_session_id') AS STRING) AS ga_session_id,
+      e.event_timestamp
+    FROM `neogen-ga4-export.analytics_331328809.events_*` e
+    WHERE _TABLE_SUFFIX BETWEEN '20250201'
+                            AND FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY))
+  ),
+  session_first_host AS (
+    SELECT
+      date,
+      user_pseudo_id,
+      ga_session_id,
+      -- choose a stable market_id for the session (first non-NULL by time)
+      (ARRAY_AGG(market_id  ORDER BY event_timestamp ASC LIMIT 1))[OFFSET(0)] AS market_id,
+      (ARRAY_AGG(hostname   ORDER BY event_timestamp ASC LIMIT 1))[OFFSET(0)] AS first_hostname
+    FROM base
+    WHERE ga_session_id IS NOT NULL
+    GROUP BY date, user_pseudo_id, ga_session_id
+  )
+  SELECT
+    date,
+    market_id,
+    first_hostname AS hostname,
+    COUNT(DISTINCT CONCAT(user_pseudo_id, ga_session_id)) AS sessions
+  FROM session_first_host
+  GROUP BY date, market_id, hostname
+
+) AS s
+FULL OUTER JOIN (
+
+  -- B) Users & Active users by hostname (event-scoped)
+  SELECT
+    -- If GA4 property is not UTC, swap here too
+    PARSE_DATE('%Y%m%d', e.event_date) AS date,
+    (SELECT value.string_value FROM UNNEST(e.event_params) WHERE key = 'market_id') AS market_id,
+    e.device.web_info.hostname AS hostname,
+    COUNT(DISTINCT e.user_pseudo_id) AS users,
+    COUNT(DISTINCT CASE WHEN e.is_active_user THEN e.user_pseudo_id END) AS active_u
+  FROM `neogen-ga4-export.analytics_331328809.events_*` e
+  WHERE _TABLE_SUFFIX BETWEEN '20250820'
+                          AND FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY))
+  GROUP BY date, market_id, hostname
+
+) AS u
+ON  s.date      = u.date
+AND s.market_id = u.market_id
+AND s.hostname  = u.hostname
+ORDER BY date ASC, users DESC;
