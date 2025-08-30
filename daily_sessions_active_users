@@ -1,32 +1,33 @@
-CREATE OR REPLACE TABLE `neogen-ga4-export.reporting_enterprise.daily_sessions_active_user` 
-AS
+
 WITH base AS (
   SELECT
-    PARSE_DATE('%Y%m%d', e.event_date) AS date,
-    e.event_timestamp,
+  PARSE_DATE('%Y%m%d', e.event_date) AS date,
     e.user_pseudo_id,
     CAST((
       SELECT value.int_value FROM UNNEST(e.event_params) WHERE key = 'ga_session_id'
     ) AS STRING) AS ga_session_id,
-    (SELECT value.string_value FROM UNNEST(e.event_params) WHERE key = 'market_id') AS market_id_event,
+
+    -- Active-user signals
     e.is_active_user,
     SAFE_CAST((
       SELECT value.int_value FROM UNNEST(e.event_params) WHERE key = 'engagement_time_msec'
     ) AS INT64) AS engagement_time_msec,
     (SELECT value.string_value FROM UNNEST(e.event_params) WHERE key = 'session_engaged') AS session_engaged,
-    e.event_name
+    e.event_name,
+
+    -- Optional: keep if you need to match a specific stream
+    -- e.stream_id
   FROM `neogen-ga4-export.analytics_331328809.events_*` AS e
-  WHERE _TABLE_SUFFIX BETWEEN '20250201'
-                          AND  FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY))
+  WHERE _TABLE_SUFFIX BETWEEN '20250820'
+                          AND FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY))
+
 ),
 
 sessionized AS (
   SELECT
     date,
-    event_timestamp,
     user_pseudo_id,
     CONCAT(user_pseudo_id, ':', COALESCE(ga_session_id, 'NOSESS')) AS session_key,
-    market_id_event,
     is_active_user,
     engagement_time_msec,
     session_engaged,
@@ -34,69 +35,48 @@ sessionized AS (
   FROM base
 ),
 
-session_market AS (
+sessions AS (
   SELECT
     date,
-    user_pseudo_id,
-    session_key,
-    COALESCE(
-      (ARRAY_AGG(market_id_event IGNORE NULLS ORDER BY event_timestamp ASC LIMIT 1))[SAFE_OFFSET(0)],
-      '(not set)'
-    ) AS market_id
+    COUNT(DISTINCT session_key) AS sessions
   FROM sessionized
-  GROUP BY date, user_pseudo_id, session_key
+  GROUP BY date
 ),
 
-sessions_by_market AS (
+active_users AS (
+  -- 1) Prefer the native flag when available (export >= 2023-07-17)
   SELECT
-    sm.date,
-    sm.market_id,
-    COUNT(DISTINCT sm.session_key) AS sessions
-  FROM session_market sm
-  GROUP BY sm.date, sm.market_id
-),
-
-active_users_by_market AS (
-  -- Primary: native flag
-  SELECT
-    sm.date,
-    sm.market_id,
-    COUNT(DISTINCT sz.user_pseudo_id) AS active_user
-  FROM session_market sm
-  JOIN sessionized sz
-    ON sz.date = sm.date AND sz.session_key = sm.session_key
-  WHERE sz.is_active_user IS TRUE
-  GROUP BY sm.date, sm.market_id
+    date,
+    COUNT(DISTINCT user_pseudo_id) AS active_user
+  FROM sessionized
+  WHERE is_active_user IS TRUE
+  GROUP BY date
 
   UNION ALL
 
-  -- Fallback: engagement proxy or first_visit/first_open (FIXED alias)
+  -- 2) Fallback for rows where is_active_user is NULL
   SELECT
-    d.date,
-    d.market_id,
-    COUNT(DISTINCT d.user_pseudo_id) AS active_user
+    date,
+    COUNT(DISTINCT user_pseudo_id) AS active_user
   FROM (
     SELECT DISTINCT
-      sm.date, sm.market_id, sz.user_pseudo_id
-    FROM session_market sm
-    JOIN sessionized sz
-      ON sz.date = sm.date AND sz.session_key = sm.session_key
-    WHERE sz.is_active_user IS NULL
+      date, user_pseudo_id
+    FROM sessionized
+    WHERE is_active_user IS NULL
       AND (
-        sz.engagement_time_msec > 0
-        OR sz.session_engaged = '1'
-        OR sz.event_name IN ('first_visit','first_open')
+        engagement_time_msec > 0
+        OR session_engaged = '1'
+        OR event_name IN ('first_visit','first_open')
       )
-  ) d
-  GROUP BY d.date, d.market_id
+  )
+  GROUP BY date
 )
 
 SELECT
-  COALESCE(a.date, s.date)            AS date,
-  COALESCE(a.market_id, s.market_id)  AS market_id,
-  IFNULL(a.active_user, 0)            AS active_user,
-  IFNULL(s.sessions, 0)               AS sessions
-FROM sessions_by_market s
-FULL OUTER JOIN active_users_by_market a
-  ON a.date = s.date AND a.market_id = s.market_id
-ORDER BY date, market_id;
+  COALESCE(a.date, s.date) AS date,
+  IFNULL(a.active_user, 0) AS active_user,
+  IFNULL(s.sessions, 0)    AS sessions
+FROM sessions s
+FULL OUTER JOIN active_users a
+  ON a.date = s.date
+ORDER BY date;
